@@ -1,7 +1,8 @@
 # Issue 2247: Lambda GPU reproduction
 
 This runs the SkyRL fully async trainer at upstream commit `53b1155` with FSDP2
-policy workers on two GPUs and non-colocated vLLM engines on two other GPUs.
+policy workers on two GPUs and non-colocated vLLM engines on two other GPUs by
+default. A three-policy, one-inference GPU layout is available for 40 GB GPUs.
 The weight transfer backend is NCCL. A probe prints whether the trainer's raw
 LM logits are finite, labeled by the number of completed weight syncs in that
 policy worker. The first sync happens at startup; sync 2 follows training step 1.
@@ -18,7 +19,9 @@ prompt tokens and 256 generated tokens per request.
 
 ## On a Lambda GPU machine
 
-Use a single Ubuntu instance with at least four 80 GB NVIDIA GPUs. In the
+Use a single Ubuntu instance with four NVIDIA GPUs. The default two-policy,
+two-inference layout targets 80 GB GPUs. On four 40 GB GPUs, use the three-policy,
+one-inference command below. In the
 Lambda console, attach your SSH key and connect using the instance IP:
 
 ```bash
@@ -42,6 +45,17 @@ command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 bash examples/train/fully_async/repro_issue_2247.sh
 ```
+
+For four 40 GB GPUs, the two-policy layout ran out of memory at the first
+Adam optimizer step. Shard the policy over three GPUs and leave one separate
+GPU for vLLM:
+
+```bash
+NUM_POLICY_GPUS=3 NUM_INFERENCE_GPUS=1 bash examples/train/fully_async/repro_issue_2247.sh
+```
+
+The launcher scales the prompt batch and generation-worker count with the
+policy GPU count, keeping four completions per policy rank.
 
 The first run downloads locked Python dependencies, the model, and a small
 GSM8K dataset. The launcher records the exact SkyRL commit, GPU state, data

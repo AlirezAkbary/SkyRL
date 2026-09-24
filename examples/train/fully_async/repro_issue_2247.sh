@@ -9,6 +9,7 @@ cd "$(dirname "$0")/../../.." || exit 1
 MODEL=${MODEL:-Qwen/Qwen3-4B-Instruct-2507}
 NUM_POLICY_GPUS=${NUM_POLICY_GPUS:-2}
 NUM_INFERENCE_GPUS=${NUM_INFERENCE_GPUS:-2}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((2 * NUM_POLICY_GPUS))}
 STEPS=${STEPS:-3}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
 DATA_DIR=${DATA_DIR:-$HOME/skyrl-issue-2247/data}
@@ -33,8 +34,8 @@ mkdir -p "$RUN_DIR" "$DATA_DIR"
 git rev-parse HEAD > "$RUN_DIR/skyrl-commit.txt"
 nvidia-smi > "$RUN_DIR/nvidia-smi.txt"
 uv --version > "$RUN_DIR/uv-version.txt"
-printf 'MODEL=%s\nNUM_POLICY_GPUS=%s\nNUM_INFERENCE_GPUS=%s\nSTEPS=%s\nMAX_MODEL_LEN=%s\nDATA_DIR=%s\n' \
-  "$MODEL" "$NUM_POLICY_GPUS" "$NUM_INFERENCE_GPUS" "$STEPS" "$MAX_MODEL_LEN" "$DATA_DIR" > "$RUN_DIR/settings.txt"
+printf 'MODEL=%s\nNUM_POLICY_GPUS=%s\nNUM_INFERENCE_GPUS=%s\nTRAIN_BATCH_SIZE=%s\nSTEPS=%s\nMAX_MODEL_LEN=%s\nDATA_DIR=%s\n' \
+  "$MODEL" "$NUM_POLICY_GPUS" "$NUM_INFERENCE_GPUS" "$TRAIN_BATCH_SIZE" "$STEPS" "$MAX_MODEL_LEN" "$DATA_DIR" > "$RUN_DIR/settings.txt"
 echo "Run directory: $RUN_DIR"
 
 if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/validation.parquet" ]]; then
@@ -55,7 +56,7 @@ SKYRL_ISSUE_2247_PROBE=1 uv run --isolated --locked --extra fsdp \
   trainer.strategy=fsdp \
   trainer.fully_async.enabled=true \
   trainer.fully_async.max_staleness_steps=1 \
-  trainer.fully_async.num_parallel_generation_workers=4 \
+  "trainer.fully_async.num_parallel_generation_workers=$TRAIN_BATCH_SIZE" \
   trainer.placement.colocate_all=false \
   "trainer.placement.policy_num_gpus_per_node=$NUM_POLICY_GPUS" \
   "trainer.placement.ref_num_gpus_per_node=$NUM_POLICY_GPUS" \
@@ -66,8 +67,8 @@ SKYRL_ISSUE_2247_PROBE=1 uv run --isolated --locked --extra fsdp \
   trainer.remove_microbatch_padding=false \
   trainer.bf16=true \
   trainer.gradient_checkpointing=true \
-  trainer.train_batch_size=4 \
-  trainer.policy_mini_batch_size=4 \
+  "trainer.train_batch_size=$TRAIN_BATCH_SIZE" \
+  "trainer.policy_mini_batch_size=$TRAIN_BATCH_SIZE" \
   trainer.micro_train_batch_size_per_gpu=1 \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.epochs=1 \
