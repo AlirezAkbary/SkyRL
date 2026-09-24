@@ -10,6 +10,7 @@ MODEL=${MODEL:-Qwen/Qwen3-4B-Instruct-2507}
 NUM_POLICY_GPUS=${NUM_POLICY_GPUS:-2}
 NUM_INFERENCE_GPUS=${NUM_INFERENCE_GPUS:-2}
 STEPS=${STEPS:-3}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
 DATA_DIR=${DATA_DIR:-$HOME/skyrl-issue-2247/data}
 RUN_DIR=${RUN_DIR:-$HOME/skyrl-issue-2247/runs/$(date -u +%Y%m%dT%H%M%SZ)}
 RUN_NAME=$(basename "$RUN_DIR")
@@ -32,8 +33,8 @@ mkdir -p "$RUN_DIR" "$DATA_DIR"
 git rev-parse HEAD > "$RUN_DIR/skyrl-commit.txt"
 nvidia-smi > "$RUN_DIR/nvidia-smi.txt"
 uv --version > "$RUN_DIR/uv-version.txt"
-printf 'MODEL=%s\nNUM_POLICY_GPUS=%s\nNUM_INFERENCE_GPUS=%s\nSTEPS=%s\nDATA_DIR=%s\n' \
-  "$MODEL" "$NUM_POLICY_GPUS" "$NUM_INFERENCE_GPUS" "$STEPS" "$DATA_DIR" > "$RUN_DIR/settings.txt"
+printf 'MODEL=%s\nNUM_POLICY_GPUS=%s\nNUM_INFERENCE_GPUS=%s\nSTEPS=%s\nMAX_MODEL_LEN=%s\nDATA_DIR=%s\n' \
+  "$MODEL" "$NUM_POLICY_GPUS" "$NUM_INFERENCE_GPUS" "$STEPS" "$MAX_MODEL_LEN" "$DATA_DIR" > "$RUN_DIR/settings.txt"
 echo "Run directory: $RUN_DIR"
 
 if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/validation.parquet" ]]; then
@@ -71,6 +72,7 @@ SKYRL_ISSUE_2247_PROBE=1 uv run --isolated --locked --extra fsdp \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.epochs=1 \
   "trainer.max_training_steps=$STEPS" \
+  "trainer.log_path=$RUN_DIR" \
   trainer.eval_before_train=false \
   trainer.eval_interval=0 \
   trainer.ckpt_interval=-1 \
@@ -90,6 +92,7 @@ SKYRL_ISSUE_2247_PROBE=1 uv run --isolated --locked --extra fsdp \
   generator.inference_engine.weight_sync_backend=nccl \
   generator.inference_engine.model_dtype=bfloat16 \
   generator.inference_engine.gpu_memory_utilization=0.7 \
+  "generator.inference_engine.engine_init_kwargs.max_model_len=$MAX_MODEL_LEN" \
   generator.inference_engine.enforce_eager=true \
   environment.env_class=gsm8k \
   trainer.logger=console \
@@ -98,7 +101,13 @@ SKYRL_ISSUE_2247_PROBE=1 uv run --isolated --locked --extra fsdp \
   "$@" > "$RUN_DIR/train.log" 2>&1
 TRAIN_STATUS=$?
 
-grep 'ISSUE2247_PROBE' "$RUN_DIR/train.log" > "$RUN_DIR/probe.log" || true
+PROBE_SOURCES=("$RUN_DIR/train.log")
+for infra_log in "$RUN_DIR"/infra-*.log; do
+  if [[ -f "$infra_log" ]]; then
+    PROBE_SOURCES+=("$infra_log")
+  fi
+done
+grep -h 'ISSUE2247_PROBE' "${PROBE_SOURCES[@]}" > "$RUN_DIR/probe.log" || true
 if grep -Eq 'kind=logits .*sync_count=([2-9]|[1-9][0-9]+) nonfinite=[1-9][0-9]*' "$RUN_DIR/probe.log"; then
   echo "RESULT=REPRODUCED: nonfinite trainer logits after post-training weight sync"
   echo "Probe: $RUN_DIR/probe.log"
@@ -108,11 +117,13 @@ fi
 if (( TRAIN_STATUS != 0 )); then
   echo "RESULT=INCONCLUSIVE: training exited with status $TRAIN_STATUS" >&2
   echo "Full log: $RUN_DIR/train.log" >&2
+  echo "Infrastructure logs: $RUN_DIR/infra-*.log" >&2
   exit 1
 fi
 if ! grep -Eq 'kind=logits .*sync_count=([2-9]|[1-9][0-9]+) ' "$RUN_DIR/probe.log"; then
   echo "RESULT=INCONCLUSIVE: no trainer forward was observed after the post-training sync" >&2
   echo "Full log: $RUN_DIR/train.log" >&2
+  echo "Infrastructure logs: $RUN_DIR/infra-*.log" >&2
   exit 1
 fi
 echo "RESULT=NOT_REPRODUCED: observed finite trainer logits after the post-training sync"
