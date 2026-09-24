@@ -3,6 +3,7 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import os
 from typing import Optional, Union
 
 import numpy as np
@@ -331,6 +332,17 @@ class HFModelWrapper(nn.Module):
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
 
         logits_BSV = output["logits"]
+        # Opt-in, issue-specific diagnostic. The policy worker sets the sync
+        # count after each completed weight broadcast; reference workers do not.
+        if os.environ.get("SKYRL_ISSUE_2247_PROBE") == "1" and "SKYRL_ISSUE_2247_SYNC_COUNT" in os.environ:
+            nonfinite = (~torch.isfinite(logits_BSV)).sum().item()
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(
+                f"ISSUE2247_PROBE kind=logits rank={rank} "
+                f"sync_count={os.environ['SKYRL_ISSUE_2247_SYNC_COUNT']} "
+                f"nonfinite={nonfinite} total={logits_BSV.numel()}",
+                flush=True,
+            )
         logits_BSV.div_(temperature)
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.

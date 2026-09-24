@@ -360,6 +360,13 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         if self._weight_transfer_sender.empty_cache_after_send or self.cfg.placement.colocate_all:
             torch.cuda.empty_cache()
         torch.distributed.barrier()
+        if os.environ.get("SKYRL_ISSUE_2247_PROBE") == "1":
+            count = int(os.environ.get("SKYRL_ISSUE_2247_SYNC_COUNT", "0")) + 1
+            os.environ["SKYRL_ISSUE_2247_SYNC_COUNT"] = str(count)
+            print(
+                f"ISSUE2247_PROBE kind=sync_complete rank={torch.distributed.get_rank()} sync_count={count}",
+                flush=True,
+            )
 
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
