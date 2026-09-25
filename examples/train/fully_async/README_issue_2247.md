@@ -100,3 +100,43 @@ Use a local model path or a Hugging Face model ID supported by both Transformers
 and vLLM. The launcher accepts additional SkyRL `key=value` overrides after
 its own settings. Do not pass credentials as CLI arguments; use the instance's
 normal credential mechanism for private models.
+
+## Hybrid student with a 27B reference
+
+The issue author later reported that their six policy GPUs also co-shard a
+27B FSDP2 reference model; two separate GPUs run vLLM. Their student is from
+the Qwen3.5 hybrid/linear-attention family. The smaller run above omitted the
+reference entirely because it set `use_kl_loss=false`.
+
+To test this closer public-model configuration, use a single Lambda machine
+with **eight 80 GB GPUs** and the same clone/install steps above. From the
+repository root, run:
+
+```bash
+bash examples/train/fully_async/repro_issue_2247_hybrid_ref.sh
+```
+
+This uses public `Qwen/Qwen3.5-4B` as the policy and
+`Qwen/Qwen3.5-27B` as the reference. Both are loaded as text-only models.
+SkyRL places six FSDP2 policy ranks and six FSDP2 reference ranks on the
+same six GPUs; the two vLLM engines use the remaining two. It enables the
+reference forward through KL loss, uses DPPO on recorded rollout logprobs,
+sets staleness to one, and leaves the vLLM KV cache uncleared on sync. The
+underlying launcher still runs three short steps and records the logits probe.
+This needs to reach the forward after sync 2 for a useful result.
+
+Run it inside `tmux` to keep the session alive. Downloading the 27B model can
+take time and substantial disk space. The model is public, so no Hugging Face
+token is required. If you want a different reference checkpoint, set
+`REF_MODEL` to a model with the same tokenizer and vocabulary as the policy.
+
+To export the evidence before terminating the instance:
+
+```bash
+tar -czf "$HOME/skyrl-issue-2247-evidence.tar.gz" -C "$HOME" skyrl-issue-2247/runs
+```
+
+Then copy it from your local computer with `scp -i /path/to/your/key
+ubuntu@INSTANCE_IP:~/skyrl-issue-2247-evidence.tar.gz .`. The logs and probe
+contain the configuration and observed result. The public weights can be
+downloaded again; they do not need to be included in the archive.

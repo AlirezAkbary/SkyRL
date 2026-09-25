@@ -2,7 +2,7 @@
 set -u
 
 # Reproduce https://github.com/NovaSky-AI/SkyRL/issues/2247 on one GPU node.
-# The policy uses FSDP2 on two GPUs; vLLM uses two different GPUs.
+# The policy uses FSDP2; vLLM uses different GPUs.
 
 cd "$(dirname "$0")/../../.." || exit 1
 
@@ -36,6 +36,7 @@ nvidia-smi > "$RUN_DIR/nvidia-smi.txt"
 uv --version > "$RUN_DIR/uv-version.txt"
 printf 'MODEL=%s\nNUM_POLICY_GPUS=%s\nNUM_INFERENCE_GPUS=%s\nTRAIN_BATCH_SIZE=%s\nSTEPS=%s\nMAX_MODEL_LEN=%s\nDATA_DIR=%s\n' \
   "$MODEL" "$NUM_POLICY_GPUS" "$NUM_INFERENCE_GPUS" "$TRAIN_BATCH_SIZE" "$STEPS" "$MAX_MODEL_LEN" "$DATA_DIR" > "$RUN_DIR/settings.txt"
+printf '%s\n' "$@" > "$RUN_DIR/overrides.txt"
 echo "Run directory: $RUN_DIR"
 
 if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/validation.parquet" ]]; then
