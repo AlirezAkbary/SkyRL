@@ -12,7 +12,9 @@ High-level notes:
 """
 
 import asyncio
+import hashlib
 import inspect
+import math
 import os
 import sys
 import time
@@ -586,6 +588,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 cur_dropped_groups,
                             )
 
+                        boundary_probe_input = None
+                        if os.environ.get("SKYRL_ISSUE_2247_BOUNDARY_PROBE") == "1" and self.global_step == 1:
+                            fwd_keys = ["sequences", "attention_mask"]
+                            for key in (
+                                "rollout_expert_indices",
+                                "router_padding_mask",
+                                "pixel_values",
+                                "image_grid_thw",
+                            ):
+                                if training_input.get(key) is not None:
+                                    fwd_keys.append(key)
+                            dp_size = self.dispatch.dp_size("policy")
+                            assert len(training_input) >= dp_size
+                            boundary_probe_input = training_input.select(
+                                keys=fwd_keys, metadata_keys=["response_length"]
+                            ).slice(0, dp_size)
+
                         # 3. Run training and update consumed UIDs.
                         with self._phase_gauge.timed_phase("run_training", self.all_timings):
                             status = await self._run_training(training_input)
@@ -593,9 +612,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 [g.uid for g in cur_generation_group_mini_batch]
                             )
 
+                        pre_sync_logprobs = None
+                        if boundary_probe_input is not None:
+                            pre_sync_logprobs = await self._issue2247_boundary_probe(
+                                boundary_probe_input, phase="pre_sync"
+                            )
+
                         # 4. After training: pause generation, sync weights, resume.
                         with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
                             await self.dispatch.save_weights_for_sampler()
+                        if boundary_probe_input is not None:
+                            await self._issue2247_boundary_probe(
+                                boundary_probe_input, phase="post_sync", before=pre_sync_logprobs
+                            )
                         # `sync_weights` above is the full bracket: it also pauses and
                         # resumes generation, which under vLLM DP costs seconds of
                         # coordinator quiesce that is not weight-sync work. The
@@ -854,6 +883,35 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             f"len={len(loss_masks) if hasattr(loss_masks, '__len__') else 'n/a'}"
         )
         sys.stderr.flush()
+
+    async def _issue2247_boundary_probe(
+        self, data: TrainingInputBatch, phase: str, before: Optional[List[float]] = None
+    ) -> List[float]:
+        """Compare one fixed policy input across the first post-training sync."""
+        data.metadata["issue2247_probe_phase"] = phase
+        fingerprint = hashlib.sha256()
+        for key in ("sequences", "attention_mask"):
+            fingerprint.update(data[key].detach().cpu().contiguous().numpy().tobytes())
+        fingerprint.update(str(data.metadata["response_length"]).encode())
+        shards = await asyncio.to_thread(self.dispatch.issue2247_probe_policy_parameters, phase)
+        output = await asyncio.to_thread(self.dispatch.forward, "policy", data)
+        logprobs = [float(value) for row in output.loss_fn_outputs for value in row["logprobs"]]
+        nonfinite = sum(not math.isfinite(value) for value in logprobs)
+        max_abs_diff = None
+        if before is not None and len(before) == len(logprobs):
+            finite_diffs = [
+                abs(a - b) for a, b in zip(before, logprobs) if math.isfinite(a) and math.isfinite(b)
+            ]
+            if finite_diffs:
+                max_abs_diff = max(finite_diffs)
+        logger.info(
+            f"ISSUE2247_PROBE kind=boundary phase={phase} step={self.global_step} "
+            f"policy_ranks={len(shards)} params_nonfinite={sum(s['nonfinite'] for s in shards)} "
+            f"params_total={sum(s['total'] for s in shards)} "
+            f"logprobs_nonfinite={nonfinite} logprobs_total={len(logprobs)} "
+            f"max_finite_logprob_diff={max_abs_diff} input_sha256={fingerprint.hexdigest()}"
+        )
+        return logprobs
 
     async def _run_training(self, training_input: TrainingInputBatch):
         # TODO(Charlie): share this code with the one-step-off async trainer.

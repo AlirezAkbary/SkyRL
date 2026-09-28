@@ -136,6 +136,29 @@ class FSDPWeightExtractor(WeightExtractor):
 
 
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
+    def issue2247_probe_parameters(self, phase: str) -> dict:
+        """Count nonfinite values in local FSDP shards without an all-gather."""
+        nonfinite = 0
+        total = 0
+        first_bad = None
+        with torch.no_grad():
+            for name, param in self.model.model.named_parameters():
+                local = param.to_local() if isinstance(param, DTensor) else param
+                total += local.numel()
+                # Bound the temporary isfinite mask even for a large embedding shard.
+                for chunk in local.reshape(-1).split(8_000_000):
+                    bad = (~torch.isfinite(chunk)).sum().item()
+                    nonfinite += bad
+                    if bad and first_bad is None:
+                        first_bad = name
+        rank = torch.distributed.get_rank()
+        print(
+            f"ISSUE2247_PROBE kind=parameters phase={phase} rank={rank} "
+            f"nonfinite={nonfinite} total={total} first_bad={first_bad or 'none'}",
+            flush=True,
+        )
+        return {"rank": rank, "nonfinite": nonfinite, "total": total}
+
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy == "fsdp"
         strategy = FSDPStrategy(
@@ -383,12 +406,31 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         Reshard the model after forward pass to redistribute memory and allow for offloading to cpu.
         """
-        output = super().forward(
-            data,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            return_per_token_outputs=return_per_token_outputs,
-        )
+        phase = (data.metadata or {}).get("issue2247_probe_phase")
+        if phase is None:
+            output = super().forward(
+                data,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
+        else:
+            previous_phase = os.environ.get("SKYRL_ISSUE_2247_PROBE_PHASE")
+            was_training = self.model.training
+            os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = phase
+            try:
+                output = super().forward(
+                    data,
+                    loss_fn=loss_fn,
+                    loss_fn_config=loss_fn_config,
+                    return_per_token_outputs=return_per_token_outputs,
+                )
+            finally:
+                self.model.train(was_training)
+                if previous_phase is None:
+                    os.environ.pop("SKYRL_ISSUE_2247_PROBE_PHASE", None)
+                else:
+                    os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = previous_phase
         # unshard the root FSDP module (https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes)
         return output
 

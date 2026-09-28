@@ -460,6 +460,13 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
+    def issue2247_probe_policy_parameters(self, phase: str) -> List[dict]:
+        """Inspect each policy rank's local parameter shards without changing GPU residency."""
+        refs = self._actor_groups["policy"].async_run_ray_method(
+            "pass_through", "issue2247_probe_parameters", phase
+        )
+        return ray.get(refs)
+
     def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
         """Set learning rate for model's optimizer.
 

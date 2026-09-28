@@ -140,3 +140,23 @@ Then copy it from your local computer with `scp -i /path/to/your/key
 ubuntu@INSTANCE_IP:~/skyrl-issue-2247-evidence.tar.gz .`. The logs and probe
 contain the configuration and observed result. The public weights can be
 downloaded again; they do not need to be included in the archive.
+
+## Check the first post-training sync boundary
+
+On the same GPU machine, update the reproduction branch and enable the extra
+probe for one run:
+
+```bash
+git pull --ff-only
+SKYRL_ISSUE_2247_BOUNDARY_PROBE=1 bash examples/train/fully_async/repro_issue_2247_hybrid_ref.sh
+```
+
+After the first optimizer step, this checks each policy rank's local FSDP
+parameter shards and forwards a fixed input. It repeats both checks on the
+same input after the first post-training weight sync. `probe.log` records
+`phase=pre_sync` and `phase=post_sync` on parameter and raw-logit lines; the
+`kind=boundary` summaries include the input SHA-256, parameter and logprob
+counts, and the largest finite logprob difference. Matching input hashes
+confirm the comparison used identical tokens and attention masks. The probe
+only runs on step 1; the normal run is unchanged when the environment
+variable is unset.

@@ -337,10 +337,12 @@ class HFModelWrapper(nn.Module):
         if os.environ.get("SKYRL_ISSUE_2247_PROBE") == "1" and "SKYRL_ISSUE_2247_SYNC_COUNT" in os.environ:
             nonfinite = (~torch.isfinite(logits_BSV)).sum().item()
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            phase = os.environ.get("SKYRL_ISSUE_2247_PROBE_PHASE")
             print(
                 f"ISSUE2247_PROBE kind=logits rank={rank} "
                 f"sync_count={os.environ['SKYRL_ISSUE_2247_SYNC_COUNT']} "
-                f"nonfinite={nonfinite} total={logits_BSV.numel()}",
+                f"nonfinite={nonfinite} total={logits_BSV.numel()}"
+                + (f" phase={phase}" if phase else ""),
                 flush=True,
             )
         logits_BSV.div_(temperature)
