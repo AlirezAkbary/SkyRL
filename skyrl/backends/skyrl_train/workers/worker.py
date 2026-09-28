@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import socket
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
@@ -933,15 +935,24 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
 
-        for microbatch in microbatch_iterator:
+        probe_first_microbatch = (
+            os.environ.get("SKYRL_ISSUE_2247_TRAIN_PATH_PROBE") == "1"
+            and os.environ.get("SKYRL_ISSUE_2247_SYNC_COUNT") == "2"
+            and not getattr(self, "_issue2247_train_path_probe_done", False)
+        )
+        for microbatch_index, microbatch in enumerate(microbatch_iterator):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
+            probe_this_microbatch = probe_first_microbatch and microbatch_index == 0
+            if probe_this_microbatch:
+                self._issue2247_train_path_probe_done = True
             metrics = self._forward_backward_micro(
                 experience,
                 microbatch_weight,
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
                 return_per_token_outputs=return_per_token_outputs,
+                **({"issue2247_train_path_probe": True} if probe_this_microbatch else {}),
             )
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
@@ -969,6 +980,118 @@ class PolicyWorkerBase(Worker):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
 
+    @contextmanager
+    def _issue2247_trace_forward(self, phase: str):
+        """Locate the first nonfinite decoder-layer output during one forward."""
+        previous_phase = os.environ.get("SKYRL_ISSUE_2247_PROBE_PHASE")
+        os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = phase
+        trace = {"first_bad_module": "none", "first_bad_index": "none", "hooked_layers": 0}
+        handles = []
+
+        def first_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return value if value.is_floating_point() else None
+            if isinstance(value, dict):
+                for item in value.values():
+                    tensor = first_tensor(item)
+                    if tensor is not None:
+                        return tensor
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    tensor = first_tensor(item)
+                    if tensor is not None:
+                        return tensor
+            return None
+
+        def check_output(name, output):
+            if trace["first_bad_module"] != "none":
+                return
+            tensor = first_tensor(output)
+            if tensor is None:
+                return
+            with torch.no_grad():
+                flat = tensor.detach().reshape(-1)
+                for start in range(0, flat.numel(), 1_000_000):
+                    bad = (~torch.isfinite(flat[start : start + 1_000_000])).nonzero(as_tuple=False)
+                    if bad.numel():
+                        offset = start + int(bad[0, 0].item())
+                        index = []
+                        for size in reversed(tensor.shape):
+                            index.append(offset % size)
+                            offset //= size
+                        trace["first_bad_module"] = name
+                        trace["first_bad_index"] = tuple(reversed(index))
+                        break
+
+        try:
+            for name, module in self.model.model.named_modules():
+                if re.search(r"(?:^|\.)(?:layers\.\d+|embed_tokens|norm|lm_head)$", name):
+                    handles.append(
+                        module.register_forward_hook(
+                            lambda _module, _args, output, module_name=name: check_output(module_name, output)
+                        )
+                    )
+            trace["hooked_layers"] = len(handles)
+            yield trace
+        finally:
+            for handle in handles:
+                handle.remove()
+            if previous_phase is None:
+                os.environ.pop("SKYRL_ISSUE_2247_PROBE_PHASE", None)
+            else:
+                os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = previous_phase
+
+    def _issue2247_probe_eval_micro(self, experience: Experience) -> None:
+        """Evaluate the exact upcoming training microbatch before its update."""
+        sequences = experience.sequences
+        attention_mask = experience.attention_mask
+        fingerprint = hashlib.sha256()
+        fingerprint.update(sequences.detach().cpu().contiguous().numpy().tobytes())
+        fingerprint.update(attention_mask.detach().cpu().contiguous().numpy().tobytes())
+        fingerprint.update(str(experience.num_actions).encode())
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"ISSUE2247_PROBE kind=step2_input rank={rank} sync_count=2 "
+            f"shape={tuple(sequences.shape)} response_length={experience.num_actions} "
+            f"attention_tokens={int(attention_mask.sum().item())} input_sha256={fingerprint.hexdigest()}",
+            flush=True,
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+                with self._issue2247_trace_forward("step2_eval") as trace, torch.no_grad(), torch.autocast(
+                    dtype=torch.bfloat16, device_type="cuda"
+                ):
+                    logprobs, _ = self.model(
+                        sequences,
+                        experience.num_actions,
+                        attention_mask=attention_mask,
+                        temperature=self.cfg.algorithm.temperature,
+                        return_output=True,
+                        compute_entropy=True,
+                        entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
+                        pixel_values=experience.pixel_values,
+                        image_grid_thw=experience.image_grid_thw,
+                    )
+            nonfinite = int((~torch.isfinite(logprobs)).sum().item())
+            first_bad_position = (
+                trace["first_bad_index"][-2]
+                if isinstance(trace["first_bad_index"], tuple) and len(trace["first_bad_index"]) >= 3
+                else "none"
+            )
+            print(
+                f"ISSUE2247_PROBE kind=step2_path phase=eval rank={rank} sync_count=2 "
+                f"logprobs_nonfinite={nonfinite} logprobs_total={logprobs.numel()} "
+                f"first_bad_module={trace['first_bad_module']} "
+                f"first_bad_index={trace['first_bad_index']} first_bad_position={first_bad_position} "
+                f"hooked_layers={trace['hooked_layers']}",
+                flush=True,
+            )
+        finally:
+            self.model.train(was_training)
+
     def _forward_backward_micro(
         self,
         experience: Experience,
@@ -976,6 +1099,7 @@ class PolicyWorkerBase(Worker):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        issue2247_train_path_probe: bool = False,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -1009,6 +1133,9 @@ class PolicyWorkerBase(Worker):
         response_mask = experience.response_mask
         rollout_action_logprobs = experience.rollout_logprobs
 
+        if issue2247_train_path_probe:
+            self._issue2247_probe_eval_micro(experience)
+
         # Determine which loss function to use
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
         if loss_fn is not None:
@@ -1030,7 +1157,8 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
-        with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
+        trace_context = self._issue2247_trace_forward("step2_train") if issue2247_train_path_probe else nullcontext()
+        with trace_context as trace, torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
             action_log_probs, output = self.model(
                 sequences,
@@ -1043,6 +1171,22 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
             )
+            if issue2247_train_path_probe:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                nonfinite = int((~torch.isfinite(action_log_probs)).sum().item())
+                first_bad_position = (
+                    trace["first_bad_index"][-2]
+                    if isinstance(trace["first_bad_index"], tuple) and len(trace["first_bad_index"]) >= 3
+                    else "none"
+                )
+                print(
+                    f"ISSUE2247_PROBE kind=step2_path phase=train rank={rank} sync_count=2 "
+                    f"logprobs_nonfinite={nonfinite} logprobs_total={action_log_probs.numel()} "
+                    f"first_bad_module={trace['first_bad_module']} "
+                    f"first_bad_index={trace['first_bad_index']} first_bad_position={first_bad_position} "
+                    f"hooked_layers={trace['hooked_layers']}",
+                    flush=True,
+                )
             # loss function
             # TODO: recompute advantages
             policy_loss, loss_metrics = current_loss_fn(

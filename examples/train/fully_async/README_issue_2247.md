@@ -160,3 +160,25 @@ counts, and the largest finite logprob difference. Matching input hashes
 confirm the comparison used identical tokens and attention masks. The probe
 only runs on step 1; the normal run is unchanged when the environment
 variable is unset.
+
+## Compare evaluation and training on the failing microbatch
+
+The boundary probe used a step-1 input and an evaluation forward. DPPO skips
+the ordinary policy evaluation forward on step 2, so the next check uses the
+first actual step-2 training microbatch instead:
+
+```bash
+git pull --ff-only
+SKYRL_ISSUE_2247_TRAIN_PATH_PROBE=1 bash examples/train/fully_async/repro_issue_2247_hybrid_ref.sh
+```
+
+On each policy rank, this runs one extra evaluation forward on that microbatch
+before its optimizer update, then observes the real gradient-enabled training
+forward. Both use the same tokens, mask, bf16 autocast, and model call
+arguments. `probe.log` contains `kind=step2_input` with an input hash,
+`kind=logits` with `phase=step2_eval` or `phase=step2_train`, and
+`kind=step2_path` with logprob counts and the first decoder module and token
+position that produced nonfinite values. `hooked_layers=0` means the module
+names did not match, so layer attribution is unavailable. This probe runs once
+per policy rank when the sync count reaches 2. It requires the reproduction
+script's `trainer.policy.use_torch_compile=false` setting for reliable hooks.
