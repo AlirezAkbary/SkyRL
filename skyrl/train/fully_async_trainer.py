@@ -946,6 +946,27 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
     async def _run_training(self, training_input: TrainingInputBatch):
         # TODO(Charlie): share this code with the one-step-off async trainer.
+        if (
+            self.global_step == 2
+            and getattr(self, "_issue2247_state_input", None) is not None
+            and self.cfg.trainer.placement.colocate_policy_ref
+            and self.ref_model is not None
+        ):
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_before_no_ref_cycle",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            cycle_state = await asyncio.to_thread(self.dispatch.issue2247_cycle_policy_without_ref_for_probe)
+            logger.info(f"ISSUE2247_PROBE kind=policy_cycle phase=no_ref step=2 {cycle_state}")
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_after_no_ref_cycle",
+                self._issue2247_state_post_sync_logprobs,
+            )
+
         # inference and calculate values, log probs, rewards, kl divergence
         with Timer("fwd_logprobs_values_reward", self.all_timings):
             training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)

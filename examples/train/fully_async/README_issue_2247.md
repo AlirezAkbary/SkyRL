@@ -194,10 +194,18 @@ SKYRL_ISSUE_2247_STATE_PROBE=1 bash examples/train/fully_async/repro_issue_2247_
 ```
 
 The probe saves one step-1 input and evaluates it immediately after the first
-post-training sync (`state_post_sync`). On step 2, after the reference-model
-forward, it reloads only the policy model and evaluates that same input
-(`state_after_model_reload`). It repeats the forward once
-(`state_model_reload_repeat`) to check whether replay itself changes the result.
+post-training sync (`state_post_sync`). At the start of step 2, it checks that
+input again (`state_before_no_ref_cycle`), then offloads and reloads the policy
+model without a reference forward and checks it again
+(`state_after_no_ref_cycle`). `kind=policy_cycle` records tracked GPU residency
+before offload, after offload, and after model-only reload. Check its
+`ref_was_on_gpu` and `ref_on_gpu` fields to confirm the reference model remained
+off GPU during this control cycle.
+
+The normal step-2 reference forward then runs. The probe reloads only the policy
+model and evaluates that same saved input (`state_after_model_reload`). It repeats
+the forward once (`state_model_reload_repeat`) to check whether replay itself
+changes the result.
 It then reloads the optimizer and evaluates the saved input again
 (`state_after_optimizer_reload`), followed by one input from the new batch
 (`state_after_optimizer_new`). `kind=policy_backload` records tracked model and
@@ -205,12 +213,13 @@ optimizer GPU residency before and after each reload. `kind=state_replay`
 records input hashes and nonfinite logprob counts; the saved-input hashes
 should match.
 
-If the first model-only replay is already nonfinite, the failure occurs by the
-reference forward or policy model reload. If both model-only replays are finite
-but the optimizer-reload replay is nonfinite, inspect optimizer reload next. If
-the model-only repeat changes the result, the forward itself may be changing
-runtime state. These checkpoints do not by themselves separate the reference
-forward from policy offload and model reload.
+If `state_before_no_ref_cycle` is nonfinite, the failure arose before the
+reference forward. If that replay is finite but `state_after_no_ref_cycle` is
+nonfinite, the policy offload/reload cycle is sufficient to trigger it. If both
+are finite but `state_after_model_reload` is nonfinite, the reference path or
+the additional offload/reload cycle matters. A repeated model-only forward
+checks whether replay itself changes the result. These checkpoints do not by
+themselves separate the reference forward from a second policy residency cycle.
 
 For each replay, `kind=norm_component` reports nonfinite counts and the first
 affected token, value head, and channel for the inputs (`core`, `gate`) and

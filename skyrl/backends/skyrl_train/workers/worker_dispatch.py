@@ -153,6 +153,32 @@ class WorkerDispatch:
             "optimizer_on_gpu": after.optimizer_on_gpu,
         }
 
+    def issue2247_cycle_policy_without_ref_for_probe(self) -> Dict[str, bool]:
+        """Use the normal policy offload/reload path without a reference forward."""
+        policy_before = self._gpu_state["policy"]
+        ref_before = self._gpu_state["ref"]
+        model_was_on_gpu = policy_before.model_on_gpu
+        optimizer_was_on_gpu = policy_before.optimizer_on_gpu
+        ref_was_on_gpu = ref_before.model_on_gpu
+
+        self._offload_inactive_model("policy")
+        policy_offloaded = self._gpu_state["policy"]
+        model_after_offload = policy_offloaded.model_on_gpu
+        optimizer_after_offload = policy_offloaded.optimizer_on_gpu
+        self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
+        policy_after = self._gpu_state["policy"]
+
+        return {
+            "model_was_on_gpu": model_was_on_gpu,
+            "optimizer_was_on_gpu": optimizer_was_on_gpu,
+            "ref_was_on_gpu": ref_was_on_gpu,
+            "model_after_offload": model_after_offload,
+            "optimizer_after_offload": optimizer_after_offload,
+            "model_on_gpu": policy_after.model_on_gpu,
+            "optimizer_on_gpu": policy_after.optimizer_on_gpu,
+            "ref_on_gpu": self._gpu_state["ref"].model_on_gpu,
+        }
+
     def _should_manage_offload(self, model: str) -> bool:
         """Check if we need to manage offload for this model."""
         if self.colocate_all:
