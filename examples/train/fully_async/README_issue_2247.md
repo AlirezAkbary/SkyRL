@@ -183,7 +183,7 @@ names did not match, so layer attribution is unavailable. This probe runs once
 per policy rank when the sync count reaches 2. It requires the reproduction
 script's `trainer.policy.use_torch_compile=false` setting for reliable hooks.
 
-## Replay one input across the reference-model transition
+## Replay one input across the reference-model transition and policy reload
 
 To distinguish an input-specific failure from a change to the policy's runtime
 state, run:
@@ -195,12 +195,22 @@ SKYRL_ISSUE_2247_STATE_PROBE=1 bash examples/train/fully_async/repro_issue_2247_
 
 The probe saves one step-1 input and evaluates it immediately after the first
 post-training sync (`state_post_sync`). On step 2, after the reference-model
-forward, it reloads both the policy model and optimizer as the training step
-normally does, then evaluates the same saved input
-(`state_after_ref_old`) and one input from the new batch
-(`state_after_ref_new`). `kind=state_replay` logs include input hashes and
-nonfinite logprob counts. Matching hashes on the two old-input lines confirm
-that the same tokens and attention mask were used.
+forward, it reloads only the policy model and evaluates that same input
+(`state_after_model_reload`). It repeats the forward once
+(`state_model_reload_repeat`) to check whether replay itself changes the result.
+It then reloads the optimizer and evaluates the saved input again
+(`state_after_optimizer_reload`), followed by one input from the new batch
+(`state_after_optimizer_new`). `kind=policy_backload` records tracked model and
+optimizer GPU residency before and after each reload. `kind=state_replay`
+records input hashes and nonfinite logprob counts; the saved-input hashes
+should match.
+
+If the first model-only replay is already nonfinite, the failure occurs by the
+reference forward or policy model reload. If both model-only replays are finite
+but the optimizer-reload replay is nonfinite, inspect optimizer reload next. If
+the model-only repeat changes the result, the forward itself may be changing
+runtime state. These checkpoints do not by themselves separate the reference
+forward from policy offload and model reload.
 
 For each replay, `kind=norm_component` reports nonfinite counts and the first
 affected token, value head, and channel for the inputs (`core`, `gate`) and

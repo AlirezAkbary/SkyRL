@@ -137,9 +137,21 @@ class WorkerDispatch:
         """Return the data-parallel size for ``model`` (e.g. "policy")."""
         return self._actor_groups[model].get_dp_size()
 
-    def issue2247_backload_policy_for_probe(self) -> None:
-        """Match the model-and-optimizer reload of the next policy training step."""
-        self._ensure_on_gpu("policy", need_optimizer=True, need_model=True)
+    def issue2247_backload_policy_for_probe(
+        self, *, need_optimizer: bool
+    ) -> Dict[str, bool]:
+        """Reload the policy model first, then its optimizer, reporting tracked residency."""
+        before = self._gpu_state["policy"]
+        model_was_on_gpu = before.model_on_gpu
+        optimizer_was_on_gpu = before.optimizer_on_gpu
+        self._ensure_on_gpu("policy", need_optimizer=need_optimizer, need_model=True)
+        after = self._gpu_state["policy"]
+        return {
+            "model_was_on_gpu": model_was_on_gpu,
+            "optimizer_was_on_gpu": optimizer_was_on_gpu,
+            "model_on_gpu": after.model_on_gpu,
+            "optimizer_on_gpu": after.optimizer_on_gpu,
+        }
 
     def _should_manage_offload(self, model: str) -> bool:
         """Check if we need to manage offload for this model."""

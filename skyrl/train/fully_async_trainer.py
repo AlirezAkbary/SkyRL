@@ -951,18 +951,36 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
 
         if self.global_step == 2 and getattr(self, "_issue2247_state_input", None) is not None:
-            await asyncio.to_thread(self.dispatch.issue2247_backload_policy_for_probe)
-            logger.info("ISSUE2247_PROBE kind=policy_backload phase=after_ref step=2 model_and_optimizer=true")
+            model_state = await asyncio.to_thread(
+                self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=False
+            )
+            logger.info(f"ISSUE2247_PROBE kind=policy_backload phase=model_only step=2 {model_state}")
             await asyncio.to_thread(
                 self._issue2247_state_forward,
                 self._issue2247_state_input,
-                "state_after_ref_old",
+                "state_after_model_reload",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_model_reload_repeat",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            optimizer_state = await asyncio.to_thread(
+                self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=True
+            )
+            logger.info(f"ISSUE2247_PROBE kind=policy_backload phase=with_optimizer step=2 {optimizer_state}")
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_after_optimizer_reload",
                 self._issue2247_state_post_sync_logprobs,
             )
             await asyncio.to_thread(
                 self._issue2247_state_forward,
                 self._issue2247_select_policy_input(training_input),
-                "state_after_ref_new",
+                "state_after_optimizer_new",
             )
 
         # calculate kl divergence and create experiences
