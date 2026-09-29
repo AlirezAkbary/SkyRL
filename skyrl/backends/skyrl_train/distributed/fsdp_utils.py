@@ -16,6 +16,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Union
 
 import torch
@@ -64,7 +65,9 @@ def should_use_meta_init(use_meta_tensor=True, mesh: DeviceMesh = None) -> bool:
 
 
 @torch.no_grad()
-def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
+def offload_fsdp2_model_to_cpu(
+    model, empty_cache: bool = True, probe_callback: Callable[[str], object] | None = None
+):
     # Materialize any leftover meta buffers (e.g. non-persistent inv_freq from
     # RotaryEmbedding created via from_config on meta device).  We must NOT call
     # model.to_empty() because that would wipe already-loaded FSDP parameters.
@@ -74,6 +77,9 @@ def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
             if buf is not None and buf.device.type == "meta":
                 module._buffers[key] = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
     model.to("cpu", non_blocking=True)
+    if probe_callback is not None:
+        torch.cuda.synchronize()
+        probe_callback("after_model_to_cpu")
     if empty_cache:
         torch.cuda.empty_cache()
 

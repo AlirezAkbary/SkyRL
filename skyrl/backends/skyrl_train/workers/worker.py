@@ -437,12 +437,19 @@ class Worker(DistributedTorchRayActor):
             offload_model: Whether to offload model parameters.
         """
         self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
-        self.strategy.offload_to_cpu(
-            self._get_module_for_offload(),
-            self.optimizer,
-            offload_optimizer=offload_optimizer,
-            offload_model=offload_model,
-        )
+        kwargs = {"offload_optimizer": offload_optimizer, "offload_model": offload_model}
+        if (
+            offload_model
+            and offload_optimizer
+            and hasattr(self, "issue2247_fingerprint_first_layer")
+            and getattr(self, "_issue2247_first_layer_baseline", None) is not None
+            and not getattr(self, "_issue2247_offload_instrumented", False)
+        ):
+            # Only the explicit forensic cycle has established a baseline.
+            # Instrument it once; later training offloads should stay untouched.
+            self._issue2247_offload_instrumented = True
+            kwargs["probe_callback"] = self.issue2247_fingerprint_first_layer
+        self.strategy.offload_to_cpu(self._get_module_for_offload(), self.optimizer, **kwargs)
 
     def backload_to_gpu(self, backload_optimizer: bool = True, backload_model: bool = True):
         """Backload worker state to GPU.

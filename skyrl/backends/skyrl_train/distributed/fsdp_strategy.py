@@ -6,6 +6,7 @@ import random
 import shutil
 import tempfile
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import List, Optional, Union
 
@@ -113,7 +114,14 @@ class FSDPStrategy(DistributedStrategy):
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, fsdp_size=self.fsdp_config.fsdp_size)
 
-    def offload_to_cpu(self, model, optimizer, offload_optimizer=True, offload_model=True):
+    def offload_to_cpu(
+        self,
+        model,
+        optimizer,
+        offload_optimizer=True,
+        offload_model=True,
+        probe_callback: Optional[Callable[[str], object]] = None,
+    ):
         """
         Offload model weights and optimizer to CPU memory.
 
@@ -124,10 +132,15 @@ class FSDPStrategy(DistributedStrategy):
 
         if self.manual_offload:
             if offload_model:
-                offload_fsdp2_model_to_cpu(model, empty_cache=True)
+                offload_fsdp2_model_to_cpu(model, empty_cache=True, probe_callback=probe_callback)
+                if probe_callback is not None:
+                    probe_callback("after_model_empty_cache")
 
             if optimizer is not None and self.manual_offload_optimizer and offload_optimizer:
                 offload_fsdp_optimizer(optimizer)
+                if probe_callback is not None:
+                    torch.cuda.synchronize()
+                    probe_callback("after_optimizer_move")
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
