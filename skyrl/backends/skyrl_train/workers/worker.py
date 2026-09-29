@@ -1041,6 +1041,68 @@ class PolicyWorkerBase(Worker):
             else:
                 os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = previous_phase
 
+    @contextmanager
+    def _issue2247_trace_norm_inputs(self, phase: str):
+        """Inspect the inputs and output of the first gated linear-attention norm."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        config = self.model.model.config
+        text_config = getattr(config, "text_config", config)
+        heads = getattr(text_config, "linear_num_value_heads", None)
+        target = next(
+            (
+                module
+                for name, module in self.model.model.named_modules()
+                if name.endswith("layers.0.linear_attn.norm")
+            ),
+            None,
+        )
+        traces = {}
+        handles = []
+
+        def scan(component: str, tensor: torch.Tensor) -> None:
+            if component in traces:
+                return
+            with torch.no_grad():
+                flat = tensor.detach().reshape(-1)
+                nonfinite = 0
+                first_flat = None
+                for start in range(0, flat.numel(), 1_000_000):
+                    bad = ~torch.isfinite(flat[start : start + 1_000_000])
+                    nonfinite += int(bad.sum().item())
+                    if first_flat is None and bool(bad.any().item()):
+                        first_flat = start + int(bad.int().argmax().item())
+                row = first_flat // tensor.shape[-1] if first_flat is not None else None
+                traces[component] = (
+                    f"nonfinite={nonfinite} total={tensor.numel()} shape={tuple(tensor.shape)} "
+                    f"first_row={row} first_token={row // heads if row is not None and heads else None} "
+                    f"first_head={row % heads if row is not None and heads else None} "
+                    f"first_channel={first_flat % tensor.shape[-1] if first_flat is not None else None}"
+                )
+
+        def before_norm(_module, args):
+            if len(args) >= 2:
+                scan("core", args[0])
+                scan("gate", args[1])
+
+        def after_norm(_module, _args, output):
+            if isinstance(output, torch.Tensor):
+                scan("output", output)
+
+        try:
+            if target is not None:
+                handles.append(target.register_forward_pre_hook(before_norm))
+                handles.append(target.register_forward_hook(after_norm))
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+            for component in ("core", "gate", "output"):
+                print(
+                    f"ISSUE2247_PROBE kind=norm_component phase={phase} rank={rank} "
+                    f"component={component} heads={heads} {traces.get(component, 'not_observed')}",
+                    flush=True,
+                )
+
     def _issue2247_probe_eval_micro(self, experience: Experience) -> None:
         """Evaluate the exact upcoming training microbatch before its update."""
         sequences = experience.sequences

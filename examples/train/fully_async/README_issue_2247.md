@@ -182,3 +182,30 @@ position that produced nonfinite values. `hooked_layers=0` means the module
 names did not match, so layer attribution is unavailable. This probe runs once
 per policy rank when the sync count reaches 2. It requires the reproduction
 script's `trainer.policy.use_torch_compile=false` setting for reliable hooks.
+
+## Replay one input across the reference-model transition
+
+To distinguish an input-specific failure from a change to the policy's runtime
+state, run:
+
+```bash
+git pull --ff-only
+SKYRL_ISSUE_2247_STATE_PROBE=1 bash examples/train/fully_async/repro_issue_2247_hybrid_ref.sh
+```
+
+The probe saves one step-1 input and evaluates it immediately after the first
+post-training sync (`state_post_sync`). On step 2, after the reference-model
+forward, it reloads both the policy model and optimizer as the training step
+normally does, then evaluates the same saved input
+(`state_after_ref_old`) and one input from the new batch
+(`state_after_ref_new`). `kind=state_replay` logs include input hashes and
+nonfinite logprob counts. Matching hashes on the two old-input lines confirm
+that the same tokens and attention mask were used.
+
+For each replay, `kind=norm_component` reports nonfinite counts and the first
+affected token, value head, and channel for the inputs (`core`, `gate`) and
+output of `model.layers.0.linear_attn.norm`. If `core` is already nonfinite,
+the problem is upstream of that norm in the linear-attention path. If only
+`gate` is nonfinite, inspect its projection. If both inputs are finite but the
+output is nonfinite, inspect the norm and its weight. These checks run only
+when `SKYRL_ISSUE_2247_STATE_PROBE=1`.

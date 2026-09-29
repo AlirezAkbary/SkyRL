@@ -1,5 +1,6 @@
 import io
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import ray
@@ -419,12 +420,19 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             was_training = self.model.training
             os.environ["SKYRL_ISSUE_2247_PROBE_PHASE"] = phase
             try:
-                output = super().forward(
-                    data,
-                    loss_fn=loss_fn,
-                    loss_fn_config=loss_fn_config,
-                    return_per_token_outputs=return_per_token_outputs,
+                trace = self._issue2247_trace_norm_inputs(phase) if phase.startswith("state_") else nullcontext()
+                rng_context = (
+                    torch.random.fork_rng(devices=[torch.cuda.current_device()])
+                    if phase.startswith("state_")
+                    else nullcontext()
                 )
+                with rng_context, trace:
+                    output = super().forward(
+                        data,
+                        loss_fn=loss_fn,
+                        loss_fn_config=loss_fn_config,
+                        return_per_token_outputs=return_per_token_outputs,
+                    )
             finally:
                 self.model.train(was_training)
                 if previous_phase is None:

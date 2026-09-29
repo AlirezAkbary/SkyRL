@@ -437,6 +437,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """
         self.global_step = 0
         self.epoch = 0
+        self._issue2247_state_input = None
+        self._issue2247_state_post_sync_logprobs = None
         resumed_start_epoch = None
 
         # Load checkpoint state if resumption is enabled. Also load the data UIDs that are already trained on.
@@ -589,21 +591,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             )
 
                         boundary_probe_input = None
-                        if os.environ.get("SKYRL_ISSUE_2247_BOUNDARY_PROBE") == "1" and self.global_step == 1:
-                            fwd_keys = ["sequences", "attention_mask"]
-                            for key in (
-                                "rollout_expert_indices",
-                                "router_padding_mask",
-                                "pixel_values",
-                                "image_grid_thw",
-                            ):
-                                if training_input.get(key) is not None:
-                                    fwd_keys.append(key)
-                            dp_size = self.dispatch.dp_size("policy")
-                            assert len(training_input) >= dp_size
-                            boundary_probe_input = training_input.select(
-                                keys=fwd_keys, metadata_keys=["response_length"]
-                            ).slice(0, dp_size)
+                        if self.global_step == 1:
+                            if os.environ.get("SKYRL_ISSUE_2247_BOUNDARY_PROBE") == "1":
+                                boundary_probe_input = self._issue2247_select_policy_input(training_input)
+                            if os.environ.get("SKYRL_ISSUE_2247_STATE_PROBE") == "1":
+                                self._issue2247_state_input = self._issue2247_select_policy_input(training_input)
 
                         # 3. Run training and update consumed UIDs.
                         with self._phase_gauge.timed_phase("run_training", self.all_timings):
@@ -624,6 +616,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         if boundary_probe_input is not None:
                             await self._issue2247_boundary_probe(
                                 boundary_probe_input, phase="post_sync", before=pre_sync_logprobs
+                            )
+                        if self.global_step == 1 and self._issue2247_state_input is not None:
+                            self._issue2247_state_post_sync_logprobs = await asyncio.to_thread(
+                                self._issue2247_state_forward, self._issue2247_state_input, "state_post_sync"
                             )
                         # `sync_weights` above is the full bracket: it also pauses and
                         # resumes generation, which under vLLM DP costs seconds of
@@ -884,6 +880,41 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         )
         sys.stderr.flush()
 
+    def _issue2247_select_policy_input(self, training_input: TrainingInputBatch) -> TrainingInputBatch:
+        fwd_keys = ["sequences", "attention_mask"]
+        for key in ("rollout_expert_indices", "router_padding_mask", "pixel_values", "image_grid_thw"):
+            if training_input.get(key) is not None:
+                fwd_keys.append(key)
+        dp_size = self.dispatch.dp_size("policy")
+        assert len(training_input) >= dp_size
+        selected = training_input.select(keys=fwd_keys, metadata_keys=["response_length"]).slice(0, dp_size)
+        for key, value in selected.items():
+            if isinstance(value, torch.Tensor):
+                selected[key] = value.clone()
+        return selected
+
+    def _issue2247_state_forward(
+        self, data: TrainingInputBatch, phase: str, before: Optional[List[float]] = None
+    ) -> List[float]:
+        """Replay a fixed input around the reference forward and policy reload."""
+        data.metadata["issue2247_probe_phase"] = phase
+        fingerprint = hashlib.sha256()
+        for key in ("sequences", "attention_mask"):
+            fingerprint.update(data[key].detach().cpu().contiguous().numpy().tobytes())
+        fingerprint.update(str(data.metadata["response_length"]).encode())
+        output = self.dispatch.forward("policy", data)
+        logprobs = [float(value) for row in output.loss_fn_outputs for value in row["logprobs"]]
+        finite_diffs = []
+        if before is not None and len(before) == len(logprobs):
+            finite_diffs = [abs(a - b) for a, b in zip(before, logprobs) if math.isfinite(a) and math.isfinite(b)]
+        logger.info(
+            f"ISSUE2247_PROBE kind=state_replay phase={phase} step={self.global_step} "
+            f"logprobs_nonfinite={sum(not math.isfinite(value) for value in logprobs)} "
+            f"logprobs_total={len(logprobs)} max_finite_logprob_diff={max(finite_diffs) if finite_diffs else None} "
+            f"input_sha256={fingerprint.hexdigest()}"
+        )
+        return logprobs
+
     async def _issue2247_boundary_probe(
         self, data: TrainingInputBatch, phase: str, before: Optional[List[float]] = None
     ) -> List[float]:
@@ -918,6 +949,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # inference and calculate values, log probs, rewards, kl divergence
         with Timer("fwd_logprobs_values_reward", self.all_timings):
             training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
+
+        if self.global_step == 2 and getattr(self, "_issue2247_state_input", None) is not None:
+            await asyncio.to_thread(self.dispatch.issue2247_backload_policy_for_probe)
+            logger.info("ISSUE2247_PROBE kind=policy_backload phase=after_ref step=2 model_and_optimizer=true")
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_after_ref_old",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_select_policy_input(training_input),
+                "state_after_ref_new",
+            )
 
         # calculate kl divergence and create experiences
         if self.cfg.trainer.algorithm.use_kl_in_reward:

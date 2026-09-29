@@ -137,6 +137,10 @@ class WorkerDispatch:
         """Return the data-parallel size for ``model`` (e.g. "policy")."""
         return self._actor_groups[model].get_dp_size()
 
+    def issue2247_backload_policy_for_probe(self) -> None:
+        """Match the model-and-optimizer reload of the next policy training step."""
+        self._ensure_on_gpu("policy", need_optimizer=True, need_model=True)
+
     def _should_manage_offload(self, model: str) -> bool:
         """Check if we need to manage offload for this model."""
         if self.colocate_all:
