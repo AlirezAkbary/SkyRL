@@ -76,7 +76,9 @@ def offload_fsdp2_model_to_cpu(
             buf = module._buffers[key]
             if buf is not None and buf.device.type == "meta":
                 module._buffers[key] = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
-    model.to("cpu", non_blocking=True)
+    # Issue #2247: the non-blocking transfer changed local FSDP2 parameter
+    # bytes on the final rank before optimizer offload. Try a blocking move.
+    model.to("cpu", non_blocking=False)
     if probe_callback is not None:
         torch.cuda.synchronize()
         probe_callback("after_model_to_cpu")
