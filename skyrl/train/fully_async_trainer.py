@@ -955,15 +955,53 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             await asyncio.to_thread(
                 self._issue2247_state_forward,
                 self._issue2247_state_input,
-                "state_before_no_ref_cycle",
+                "state_before_split_control",
                 self._issue2247_state_post_sync_logprobs,
             )
-            cycle_state = await asyncio.to_thread(self.dispatch.issue2247_cycle_policy_without_ref_for_probe)
-            logger.info(f"ISSUE2247_PROBE kind=policy_cycle phase=no_ref step=2 {cycle_state}")
+            optimizer_offload_state = await asyncio.to_thread(
+                self.dispatch.issue2247_offload_policy_for_probe,
+                offload_optimizer=True,
+                offload_model=False,
+            )
+            logger.info(
+                f"ISSUE2247_PROBE kind=policy_offload phase=optimizer_only step=2 {optimizer_offload_state}"
+            )
             await asyncio.to_thread(
                 self._issue2247_state_forward,
                 self._issue2247_state_input,
-                "state_after_no_ref_cycle",
+                "state_after_optimizer_offload",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            optimizer_restore_state = await asyncio.to_thread(
+                self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=True
+            )
+            logger.info(
+                f"ISSUE2247_PROBE kind=policy_backload phase=optimizer_restore step=2 {optimizer_restore_state}"
+            )
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_after_optimizer_restore",
+                self._issue2247_state_post_sync_logprobs,
+            )
+            model_offload_state = await asyncio.to_thread(
+                self.dispatch.issue2247_offload_policy_for_probe,
+                offload_optimizer=False,
+                offload_model=True,
+            )
+            logger.info(
+                f"ISSUE2247_PROBE kind=policy_offload phase=model_only step=2 {model_offload_state}"
+            )
+            model_restore_state = await asyncio.to_thread(
+                self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=False
+            )
+            logger.info(
+                f"ISSUE2247_PROBE kind=policy_backload phase=model_restore step=2 {model_restore_state}"
+            )
+            await asyncio.to_thread(
+                self._issue2247_state_forward,
+                self._issue2247_state_input,
+                "state_after_model_cycle",
                 self._issue2247_state_post_sync_logprobs,
             )
 

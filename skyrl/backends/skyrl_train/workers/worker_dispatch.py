@@ -153,27 +153,22 @@ class WorkerDispatch:
             "optimizer_on_gpu": after.optimizer_on_gpu,
         }
 
-    def issue2247_cycle_policy_without_ref_for_probe(self) -> Dict[str, bool]:
-        """Use the normal policy offload/reload path without a reference forward."""
+    def issue2247_offload_policy_for_probe(
+        self, *, offload_optimizer: bool, offload_model: bool
+    ) -> Dict[str, bool]:
+        """Move one policy state component to CPU and report tracked residency."""
+        assert offload_optimizer != offload_model
         policy_before = self._gpu_state["policy"]
         ref_before = self._gpu_state["ref"]
         model_was_on_gpu = policy_before.model_on_gpu
         optimizer_was_on_gpu = policy_before.optimizer_on_gpu
         ref_was_on_gpu = ref_before.model_on_gpu
-
-        self._offload_inactive_model("policy")
-        policy_offloaded = self._gpu_state["policy"]
-        model_after_offload = policy_offloaded.model_on_gpu
-        optimizer_after_offload = policy_offloaded.optimizer_on_gpu
-        self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
+        self._offload("policy", offload_optimizer=offload_optimizer, offload_model=offload_model)
         policy_after = self._gpu_state["policy"]
-
         return {
             "model_was_on_gpu": model_was_on_gpu,
             "optimizer_was_on_gpu": optimizer_was_on_gpu,
             "ref_was_on_gpu": ref_was_on_gpu,
-            "model_after_offload": model_after_offload,
-            "optimizer_after_offload": optimizer_after_offload,
             "model_on_gpu": policy_after.model_on_gpu,
             "optimizer_on_gpu": policy_after.optimizer_on_gpu,
             "ref_on_gpu": self._gpu_state["ref"].model_on_gpu,

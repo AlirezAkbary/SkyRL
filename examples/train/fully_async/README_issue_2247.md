@@ -195,12 +195,14 @@ SKYRL_ISSUE_2247_STATE_PROBE=1 bash examples/train/fully_async/repro_issue_2247_
 
 The probe saves one step-1 input and evaluates it immediately after the first
 post-training sync (`state_post_sync`). At the start of step 2, it checks that
-input again (`state_before_no_ref_cycle`), then offloads and reloads the policy
-model without a reference forward and checks it again
-(`state_after_no_ref_cycle`). `kind=policy_cycle` records tracked GPU residency
-before offload, after offload, and after model-only reload. Check its
-`ref_was_on_gpu` and `ref_on_gpu` fields to confirm the reference model remained
-off GPU during this control cycle.
+input again (`state_before_split_control`). It then offloads only the policy
+optimizer and replays the input (`state_after_optimizer_offload`). It reloads
+the optimizer and replays again (`state_after_optimizer_restore`). Finally, it
+offloads and reloads only the policy model, keeping the optimizer on GPU, and
+replays once more (`state_after_model_cycle`). No reference forward runs during
+these controls. `kind=policy_offload` and `kind=policy_backload` report tracked
+GPU residency; check `ref_was_on_gpu` and `ref_on_gpu` on offload lines to
+confirm the reference stayed off GPU.
 
 The normal step-2 reference forward then runs. The probe reloads only the policy
 model and evaluates that same saved input (`state_after_model_reload`). It repeats
@@ -213,13 +215,11 @@ optimizer GPU residency before and after each reload. `kind=state_replay`
 records input hashes and nonfinite logprob counts; the saved-input hashes
 should match.
 
-If `state_before_no_ref_cycle` is nonfinite, the failure arose before the
-reference forward. If that replay is finite but `state_after_no_ref_cycle` is
-nonfinite, the policy offload/reload cycle is sufficient to trigger it. If both
-are finite but `state_after_model_reload` is nonfinite, the reference path or
-the additional offload/reload cycle matters. A repeated model-only forward
-checks whether replay itself changes the result. These checkpoints do not by
-themselves separate the reference forward from a second policy residency cycle.
+If `state_before_split_control` is nonfinite, the failure arose before either
+offload. If `state_after_optimizer_offload` is the first nonfinite replay,
+inspect optimizer offload. If optimizer offload and restore stay finite but
+`state_after_model_cycle` is nonfinite, inspect the model CPU round trip. The
+normal reference path that follows remains available for comparison.
 
 For each replay, `kind=norm_component` reports nonfinite counts and the first
 affected token, value head, and channel for the inputs (`core`, `gate`) and
