@@ -594,7 +594,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         if self.global_step == 1:
                             if os.environ.get("SKYRL_ISSUE_2247_BOUNDARY_PROBE") == "1":
                                 boundary_probe_input = self._issue2247_select_policy_input(training_input)
-                            if os.environ.get("SKYRL_ISSUE_2247_STATE_PROBE") == "1":
+                            if (
+                                os.environ.get("SKYRL_ISSUE_2247_STATE_PROBE") == "1"
+                                or os.environ.get("SKYRL_ISSUE_2247_FORENSIC_PROBE") == "1"
+                            ):
                                 self._issue2247_state_input = self._issue2247_select_policy_input(training_input)
 
                         # 3. Run training and update consumed UIDs.
@@ -896,7 +899,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     def _issue2247_state_forward(
         self, data: TrainingInputBatch, phase: str, before: Optional[List[float]] = None
     ) -> List[float]:
-        """Replay a fixed input around the reference forward and policy reload."""
+        """Replay a fixed input around policy residency changes."""
         data.metadata["issue2247_probe_phase"] = phase
         fingerprint = hashlib.sha256()
         for key in ("sequences", "attention_mask"):
@@ -914,6 +917,32 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             f"input_sha256={fingerprint.hexdigest()}"
         )
         return logprobs
+
+    async def _issue2247_forensic_probe(self) -> None:
+        """Check model bytes and one fixed forward around the known failing offload path."""
+        await asyncio.to_thread(
+            self._issue2247_state_forward,
+            self._issue2247_state_input,
+            "state_before_combined_cycle",
+            self._issue2247_state_post_sync_logprobs,
+        )
+        await asyncio.to_thread(self.dispatch.issue2247_fingerprint_policy_first_layer, "before_combined_offload")
+        offloaded = await asyncio.to_thread(
+            self.dispatch.issue2247_offload_policy_for_probe,
+            offload_optimizer=True,
+            offload_model=True,
+        )
+        logger.info(f"ISSUE2247_PROBE kind=policy_offload phase=combined step=2 {offloaded}")
+        await asyncio.to_thread(self.dispatch.issue2247_fingerprint_policy_first_layer, "after_combined_offload")
+        reloaded = await asyncio.to_thread(self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=False)
+        logger.info(f"ISSUE2247_PROBE kind=policy_backload phase=model_only step=2 {reloaded}")
+        await asyncio.to_thread(self.dispatch.issue2247_fingerprint_policy_first_layer, "after_model_reload")
+        await asyncio.to_thread(
+            self._issue2247_state_forward,
+            self._issue2247_state_input,
+            "state_after_combined_cycle",
+            self._issue2247_state_post_sync_logprobs,
+        )
 
     async def _issue2247_boundary_probe(
         self, data: TrainingInputBatch, phase: str, before: Optional[List[float]] = None
@@ -949,8 +978,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if (
             self.global_step == 2
             and getattr(self, "_issue2247_state_input", None) is not None
+            and os.environ.get("SKYRL_ISSUE_2247_FORENSIC_PROBE") == "1"
             and self.cfg.trainer.placement.colocate_policy_ref
             and self.ref_model is not None
+        ):
+            await self._issue2247_forensic_probe()
+
+        if (
+            self.global_step == 2
+            and getattr(self, "_issue2247_state_input", None) is not None
+            and self.cfg.trainer.placement.colocate_policy_ref
+            and self.ref_model is not None
+            and os.environ.get("SKYRL_ISSUE_2247_FORENSIC_PROBE") != "1"
         ):
             await asyncio.to_thread(
                 self._issue2247_state_forward,
@@ -1009,7 +1048,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         with Timer("fwd_logprobs_values_reward", self.all_timings):
             training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
 
-        if self.global_step == 2 and getattr(self, "_issue2247_state_input", None) is not None:
+        if (
+            self.global_step == 2
+            and getattr(self, "_issue2247_state_input", None) is not None
+            and os.environ.get("SKYRL_ISSUE_2247_FORENSIC_PROBE") != "1"
+        ):
             model_state = await asyncio.to_thread(
                 self.dispatch.issue2247_backload_policy_for_probe, need_optimizer=False
             )

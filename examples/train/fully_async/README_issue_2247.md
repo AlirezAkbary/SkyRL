@@ -228,3 +228,37 @@ the problem is upstream of that norm in the linear-attention path. If only
 `gate` is nonfinite, inspect its projection. If both inputs are finite but the
 output is nonfinite, inspect the norm and its weight. These checks run only
 when `SKYRL_ISSUE_2247_STATE_PROBE=1`.
+
+## One-run model-state forensic check
+
+The split control showed that optimizer movement alone left the saved input
+unchanged, while a model-only CPU round trip changed a logprob substantially.
+This check repeats the known failing combined offload path and records where
+model contents or activations first change:
+
+```bash
+git pull --ff-only
+STEPS=2 SKYRL_ISSUE_2247_FORENSIC_PROBE=1 bash examples/train/fully_async/repro_issue_2247_hybrid_ref.sh
+```
+
+The forensic flag also enables the saved-input replay. At the start of step 2,
+the probe replays it (`state_before_combined_cycle`), fingerprints each rank's
+local token embedding and layer-0 parameter shards plus all model buffers, then
+offloads both policy model and optimizer through the normal colocation path.
+It fingerprints the policy on CPU, reloads only the model, fingerprints it on
+GPU, and replays the same input (`state_after_combined_cycle`). Hashes compare
+tensor contents across devices; `kind=model_fingerprint_change` names any
+changed tensor. `kind=linear_stage` records finite counts and hashes for the
+input and projections of layer 0's linear attention before and after the cycle.
+The existing `kind=norm_component` lines show whether the linear-attention core
+becomes nonfinite after those projections. Fingerprints are limited to the
+earliest relevant parameters and buffers to keep the GPU run short.
+Check that `kind=model_fingerprint` reports a positive parameter count and
+`errors=0` on each rank before relying on an unchanged hash.
+
+If the hashes change, inspect the named tensor and whether the change appears
+on CPU or only after GPU reload. If hashes match but the linear-attention input
+or projections change, inspect FSDP gather/runtime state. If those hashes also
+match while the core changes, focus on the convolution, gate calculation, and
+gated-delta-rule kernel. This mode skips the older split and after-reference
+replays so one two-step run answers the new question.

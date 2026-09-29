@@ -156,14 +156,17 @@ class WorkerDispatch:
     def issue2247_offload_policy_for_probe(
         self, *, offload_optimizer: bool, offload_model: bool
     ) -> Dict[str, bool]:
-        """Move one policy state component to CPU and report tracked residency."""
-        assert offload_optimizer != offload_model
+        """Move policy state to CPU and report tracked residency."""
+        assert offload_optimizer or offload_model
         policy_before = self._gpu_state["policy"]
         ref_before = self._gpu_state["ref"]
         model_was_on_gpu = policy_before.model_on_gpu
         optimizer_was_on_gpu = policy_before.optimizer_on_gpu
         ref_was_on_gpu = ref_before.model_on_gpu
-        self._offload("policy", offload_optimizer=offload_optimizer, offload_model=offload_model)
+        if offload_optimizer and offload_model:
+            self._offload_inactive_model("policy")
+        else:
+            self._offload("policy", offload_optimizer=offload_optimizer, offload_model=offload_model)
         policy_after = self._gpu_state["policy"]
         return {
             "model_was_on_gpu": model_was_on_gpu,
@@ -173,6 +176,13 @@ class WorkerDispatch:
             "optimizer_on_gpu": policy_after.optimizer_on_gpu,
             "ref_on_gpu": self._gpu_state["ref"].model_on_gpu,
         }
+
+    def issue2247_fingerprint_policy_first_layer(self, phase: str) -> List[dict]:
+        """Fingerprint local policy shards and buffers without an all-gather."""
+        refs = self._actor_groups["policy"].async_run_ray_method(
+            "pass_through", "issue2247_fingerprint_first_layer", phase
+        )
+        return ray.get(refs)
 
     def _should_manage_offload(self, model: str) -> bool:
         """Check if we need to manage offload for this model."""

@@ -1043,8 +1043,9 @@ class PolicyWorkerBase(Worker):
 
     @contextmanager
     def _issue2247_trace_norm_inputs(self, phase: str):
-        """Inspect the inputs and output of the first gated linear-attention norm."""
+        """Inspect layer-0 linear attention at the norm and, for forensics, its projections."""
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        forensic = phase in ("state_before_combined_cycle", "state_after_combined_cycle")
         config = self.model.model.config
         text_config = getattr(config, "text_config", config)
         heads = getattr(text_config, "linear_num_value_heads", None)
@@ -1057,6 +1058,7 @@ class PolicyWorkerBase(Worker):
             None,
         )
         traces = {}
+        stage_traces = {}
         handles = []
 
         def scan(component: str, tensor: torch.Tensor) -> None:
@@ -1079,6 +1081,26 @@ class PolicyWorkerBase(Worker):
                     f"first_channel={first_flat % tensor.shape[-1] if first_flat is not None else None}"
                 )
 
+        def scan_stage(component: str, tensor: torch.Tensor) -> None:
+            if component in stage_traces or not isinstance(tensor, torch.Tensor):
+                return
+            try:
+                with torch.no_grad():
+                    local = tensor.detach().contiguous()
+                    flat = local.reshape(-1)
+                    nonfinite = sum(
+                        int((~torch.isfinite(chunk)).sum().item()) for chunk in flat.split(1_000_000)
+                    )
+                    digest = hashlib.sha256()
+                    for chunk in local.view(torch.uint8).reshape(-1).split(16_000_000):
+                        digest.update(memoryview(chunk.cpu().numpy()))
+                    stage_traces[component] = (
+                        f"nonfinite={nonfinite} total={tensor.numel()} "
+                        f"shape={tuple(tensor.shape)} sha256={digest.hexdigest()}"
+                    )
+            except Exception as exc:
+                stage_traces[component] = f"error={type(exc).__name__}:{str(exc)[:120]}"
+
         def before_norm(_module, args):
             if len(args) >= 2:
                 scan("core", args[0])
@@ -1092,6 +1114,26 @@ class PolicyWorkerBase(Worker):
             if target is not None:
                 handles.append(target.register_forward_pre_hook(before_norm))
                 handles.append(target.register_forward_hook(after_norm))
+            if forensic:
+                for name, module in self.model.model.named_modules():
+                    if name.endswith("layers.0.linear_attn"):
+                        handles.append(
+                            module.register_forward_pre_hook(
+                                lambda _module, args: scan_stage("linear_input", args[0]) if args else None
+                            )
+                        )
+                    for suffix, component in (
+                        ("in_proj_qkv", "proj_qkv"),
+                        ("in_proj_z", "proj_z"),
+                        ("in_proj_b", "proj_b"),
+                        ("in_proj_a", "proj_a"),
+                    ):
+                        if name.endswith(f"layers.0.linear_attn.{suffix}"):
+                            handles.append(
+                                module.register_forward_hook(
+                                    lambda _module, _args, output, component=component: scan_stage(component, output)
+                                )
+                            )
             yield
         finally:
             for handle in handles:
@@ -1102,6 +1144,13 @@ class PolicyWorkerBase(Worker):
                     f"component={component} heads={heads} {traces.get(component, 'not_observed')}",
                     flush=True,
                 )
+            if forensic:
+                for component in ("linear_input", "proj_qkv", "proj_z", "proj_b", "proj_a"):
+                    print(
+                        f"ISSUE2247_PROBE kind=linear_stage phase={phase} rank={rank} "
+                        f"component={component} {stage_traces.get(component, 'not_observed')}",
+                        flush=True,
+                    )
 
     def _issue2247_probe_eval_micro(self, experience: Experience) -> None:
         """Evaluate the exact upcoming training microbatch before its update."""

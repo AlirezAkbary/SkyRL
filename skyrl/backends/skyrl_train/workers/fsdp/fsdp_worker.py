@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 from contextlib import nullcontext
@@ -137,6 +138,85 @@ class FSDPWeightExtractor(WeightExtractor):
 
 
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
+    def issue2247_fingerprint_first_layer(self, phase: str) -> dict:
+        """Compare local embedding, layer-0, and buffer bytes across a CPU round trip."""
+        fingerprints = {}
+        devices = {}
+        bytes_hashed = 0
+        meta_tensors = 0
+        error_tensors = []
+        selected_parameters = 0
+        selected_buffers = 0
+
+        with torch.no_grad():
+            for kind, tensors in (
+                ("parameter", self.model.model.named_parameters()),
+                ("buffer", self.model.model.named_buffers()),
+            ):
+                for name, tensor in tensors:
+                    if kind == "parameter" and not (
+                        "embed_tokens" in name or name.startswith("layers.0.") or ".layers.0." in name
+                    ):
+                        continue
+                    key = f"{kind}:{name}"
+                    if kind == "parameter":
+                        selected_parameters += 1
+                    else:
+                        selected_buffers += 1
+                    try:
+                        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                        devices[key] = str(local.device)
+                        header = f"{local.dtype}:{tuple(local.shape)}:"
+                        if local.device.type == "meta":
+                            fingerprints[key] = header + "meta"
+                            meta_tensors += 1
+                            continue
+                        digest = hashlib.sha256()
+                        byte_view = local.detach().contiguous().view(torch.uint8).reshape(-1)
+                        bytes_hashed += byte_view.numel()
+                        for chunk in byte_view.split(16_000_000):
+                            digest.update(memoryview(chunk.cpu().numpy()))
+                        fingerprints[key] = header + digest.hexdigest()
+                    except Exception as exc:
+                        devices.setdefault(key, "unknown")
+                        fingerprints[key] = f"error:{type(exc).__name__}:{str(exc)[:120]}"
+                        error_tensors.append(key)
+
+        baseline = getattr(self, "_issue2247_first_layer_baseline", None)
+        if phase == "before_combined_offload":
+            self._issue2247_first_layer_baseline = (fingerprints, devices)
+            changed = []
+        elif baseline is None:
+            changed = ["baseline_missing"]
+        else:
+            before_fingerprints, before_devices = baseline
+            changed = sorted(
+                key
+                for key in fingerprints.keys() | before_fingerprints.keys()
+                if fingerprints.get(key) != before_fingerprints.get(key)
+            )
+            for key in changed:
+                print(
+                    f"ISSUE2247_PROBE kind=model_fingerprint_change phase={phase} "
+                    f"rank={torch.distributed.get_rank()} name={key} "
+                    f"before={before_fingerprints.get(key, 'missing')} "
+                    f"after={fingerprints.get(key, 'missing')} "
+                    f"before_device={before_devices.get(key, 'missing')} "
+                    f"after_device={devices.get(key, 'missing')}",
+                    flush=True,
+                )
+
+        rank = torch.distributed.get_rank()
+        print(
+            f"ISSUE2247_PROBE kind=model_fingerprint phase={phase} rank={rank} "
+            f"parameters={selected_parameters} buffers={selected_buffers} "
+            f"bytes_hashed={bytes_hashed} meta_tensors={meta_tensors} "
+            f"errors={len(error_tensors)} first_error={error_tensors[0] if error_tensors else 'none'} "
+            f"changed={len(changed)} first_changed={changed[0] if changed else 'none'}",
+            flush=True,
+        )
+        return {"rank": rank, "changed": len(changed), "tensors": len(fingerprints)}
+
     def issue2247_probe_parameters(self, phase: str) -> dict:
         """Count nonfinite values in local FSDP shards without an all-gather."""
         nonfinite = 0
